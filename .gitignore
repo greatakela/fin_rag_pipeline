@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+sec-edgar-filings/
+*.log
+.env
+.env.*
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# OS files
+.DS_Store
+
+# Data, models, secrets
+data/
+*.db
+*.sqlite
+.env
+.env.*
+
+# Experiment logs/results
+logs/
+runs/
+*.log
+*.csv
+*.json
+
+# VSCode settings
+.vscode/

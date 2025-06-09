@@ -1,0 +1,8 @@
+experiment_name: baseline
+chunker: markdown_heading
+embedder: openai_text_embedding_3_large
+retriever: hybrid
+reranker: bge_reranker
+llm: gpt-4o
+metrics: [NDCG@10, Recall@5, Faithfulness, Cost]
+tags: [baseline, openai, hybrid]
