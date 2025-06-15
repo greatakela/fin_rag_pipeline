@@ -46,7 +46,7 @@ class EdgarIngestor:
         # files = sorted(output_dir.glob("*/full-submission.txt"), reverse=True)
         # Only keep the latest num_filings
         files = files[:num_filings]
-        print(f"[DEBUG] Found {len(files)} filings in {output_dir.resolve()}")
+        # print(f"[DEBUG] Found {len(files)} filings in {output_dir.resolve()}")
         return files
 
     def load_filings(self, ticker, filing_type="10-K", num_filings=5, 

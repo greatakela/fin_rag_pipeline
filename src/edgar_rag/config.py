@@ -10,6 +10,9 @@ LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "fin-rag-pipeline")
 
 # Example config for experimentation
 EXPERIMENT_CONFIG = {
+    "faiss_path": "data/fin_rag_faiss.index",
+    "metadata_path": "data/fin_rag_metadata.json",
+    'embeddings_path': 'data/fin_rag_embeddings.npy',
     "filing_type": "10-K",          # 10-Q, 10_K
     "ticker": "NVDA",               # AAPL, GOOGL, MSFT, AMZN, META, TSLA, NVDA, etc.
     "num_filings": 3,
@@ -24,7 +27,7 @@ EXPERIMENT_CONFIG = {
     "embedder": "openai",           # Or "sentence_transformers", "bge", etc.
     "embedding_model": "text-embedding-3-small",  # for OpenAI; else model name/path
     "embedding_batch_size": 32,
-    "retrieval_query": "What was the aggregate voting stock value in March 2002?", # What was the aggregate voting stock value in 2002?  What were the terms of Microsoft Agreement? How much was paid in advance by Microsoft in 2000 per terms of Microsoft Agreement?
+    "retrieval_query": "How have gross margins changed compared to prior years?", # What was the aggregate voting stock value in 2002?  What were the terms of Microsoft Agreement? How much was paid in advance by Microsoft in 2000 per terms of Microsoft Agreement?
     "query_processing": "rewrite_llm",  # or "extract_keywords", "rewrite", "chain", "none", "expand"
     "llm_model_name": "gpt-4o",
     "hybrid_alpha": 0.5,

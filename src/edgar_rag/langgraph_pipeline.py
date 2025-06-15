@@ -5,10 +5,12 @@
 
 import os
 import time
+import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from langgraph.graph import StateGraph
 from langsmith.run_helpers import traceable
+from ragas.metrics import faithfulness, answer_relevancy, context_precision
 
 from src.edgar_rag.config import EXPERIMENT_CONFIG
 from src.edgar_rag.data_loader import EdgarIngestor
@@ -16,6 +18,7 @@ from src.edgar_rag.chunker import Chunker, chunk_coherence, chunk_redundancy
 from src.edgar_rag.utils import extract_clean_text_and_tables, print_pipeline_summary, print_metrics_block
 from src.edgar_rag.embedding import embed_texts
 from src.edgar_rag.utils import count_tokens, split_chunk_on_token_limit, format_chat_history
+from src.edgar_rag.utils import debug_print_chunks, debug_print_metrics, debug_print_chunks, debug_print_reranked, debug_state
 from src.edgar_rag.embedding_eval import cosine_similarity_matrix, recall_at_k, ndcg_at_k
 from src.edgar_rag.hybrid_storage import FaissVectorStore, BM25Store, HybridRetriever
 from src.edgar_rag.query_processing import QueryProcessor
@@ -27,6 +30,8 @@ from src.edgar_rag.llm import llm_generate_answer
 from src.edgar_rag.doc_selector import advanced_context_window_selection
 from src.edgar_rag.validation import validate_answer
 from src.edgar_rag.utils import clean_10k_text, chunk_by_sec_headings, sub_chunk_section
+from src.edgar_rag.faiss_persistence import save_faiss_and_metadata, load_faiss_and_metadata, maybe_load_embeddings
+from src.edgar_rag.eval import chunk_coverage, retrieval_metrics, evaluate_generation_with_ragas, json_safe
 
 # ================================================================================
 #
@@ -50,6 +55,7 @@ class PipelineState:
     embedding_metrics: Dict[str, Any] = field(default_factory=dict)
     tables: List[Any] = field(default_factory=list)    # New: list of DataFrames
     vector_store: Any = None
+    chunk_metadata: list = field(default_factory=list)  # List of dicts loaded from JSON
     bm25_store: Any = None
     query: str = ""
     query_keywords: list = field(default_factory=list)
@@ -58,6 +64,11 @@ class PipelineState:
     history: list = field(default_factory=list)  # List of {"user": ..., "assistant": ...}
     selected_context: List[str] = field(default_factory=list)
     llm_answer: Optional[str] = None
+    # --- For evaluation ---
+    eval_logs: List[Dict[str, Any]] = field(default_factory=list)
+    ragas_metrics: Dict[str, Any] = field(default_factory=dict)  # One-off or per-query
+    langsmith_metrics: Dict[str, Any] = field(default_factory=dict)
+    gold_answers: List[Dict[str, Any]] = field(default_factory=list)  # For eval
     # Add other fields as your pipeline grows
 
 # 3. Pipeline stage nodes with tracing
@@ -72,8 +83,17 @@ def load_filings_node(state: PipelineState, config):
         filing_type,
         num_filings=num_filings
     )
-    print(f"[Node] Loaded {len(filings)} filings for {ticker} ({filing_type})")
+    print(f"[Data Loading Node] Loaded {len(filings)} filings for {ticker} ({filing_type})")
     state.filings = filings
+    state.metrics['filings_loaded'] = len(state.filings)
+    # Example: log missing/parse errors if applicable
+    # state.metrics['filings_parse_errors'] = ...
+    # Add to eval_logs:
+    state.eval_logs.append({
+        "stage": "loading",
+        "filings_loaded": len(state.filings),
+        "timestamp": time.time(),
+    })
     print('=================================')
     print(' ')
     # print('Loader Module Summary:')
@@ -95,37 +115,10 @@ def chunker_node(state: PipelineState, config):
         filing["tables"] = tables
         all_tables.extend(tables)
 
-# DEBUGGGGING
-#        headings = find_sec_item_headings(clean_text)
-#        print(f"[DEBUG] Found {len(headings)} ITEM headings")
-#        if headings:
-#            for item_num, sec_title, start, end in headings:
-#                print(f"  ITEM {item_num} | {sec_title} | starts at {start}")
-#        
-#        for line in clean_text.splitlines():
-#            if "ITEM" in line.upper():
-#                print("[DEBUG] ITEM candidate line:", line)
-# DEBUGGGGING
         # Chunk cleaned text
          
         # Step 2: Chunk the text by SEC section headings
         section_chunks = chunk_by_sec_headings(clean_text)
-
-        # Optionally, further split big section chunks by tokens, etc.
-        # (You can add this as needed for very large sections)
-
-        # --- Add section chunks to main chunk list ---
-        '''
-        for chunk in section_chunks:
-            chunk['metadata'] = {
-                "section": chunk["section"],
-                "title": chunk["title"],
-                "accession": filing.get("accession_number", ""),
-                "company": filing.get("company", ""),
-                "filing_type": filing.get("filing_type", "")
-            }
-            all_chunks.append(chunk)
-        '''
 
         # Step 3: For each section, optionally sub-chunk if too large
         for sec in section_chunks:
@@ -151,10 +144,19 @@ def chunker_node(state: PipelineState, config):
                 # Section is small enough; add as-is
                 sec["source"] = filing.get("source_filename", "")
                 all_chunks.append(sec)
-
-    print(f"[Node] Created {len(all_chunks)} section-aware sub-chunks from {len(section_chunks)} SEC sections. Extracted {len(all_tables)} tables.")
+    # debug_print_chunks("Section-Aware Chunks (Post Chunker)", all_chunks, n=5)
+    print(f"[Chunker Node] Created {len(all_chunks)} section-aware sub-chunks from {len(section_chunks)} SEC sections. Extracted {len(all_tables)} tables.")
     state.chunks = all_chunks
     state.tables = all_tables
+    state.metrics['chunks_created'] = len(all_chunks)
+    state.metrics['avg_chunk_size'] = np.mean([len(c['chunk']) for c in all_chunks]) if all_chunks else 0
+    # Add to eval_logs:
+    state.eval_logs.append({
+        "stage": "chunking",
+        "chunks_created": len(all_chunks),
+        "avg_chunk_size": np.mean([len(c['chunk']) for c in all_chunks]) if all_chunks else 0,
+        "timestamp": time.time(),
+    })
     print('=================================')
     print(' ')
     # print('Chunker Module Summary:')
@@ -165,8 +167,11 @@ def chunker_node(state: PipelineState, config):
 def chunk_eval_node(state: PipelineState, config):
     coh = chunk_coherence(state.chunks)
     red = chunk_redundancy(state.chunks)
-    print(f"[Node] Chunk coherence={coh:.2f}, redundancy={red:.2f}")
+    print(f"[Chunker Eval Node] Chunk coherence={coh:.2f}, redundancy={red:.2f}")
     state.chunk_metrics = {"coherence": coh, "redundancy": red}
+    coverage = chunk_coverage(state.filings, state.chunks)
+    state.chunk_metrics['coverage'] = coverage
+    debug_print_metrics("Chunker Metrics", state.chunk_metrics)
     print('=================================')
     print(' ')
     # print('Chunk Evaluation Module Summary:')
@@ -176,8 +181,23 @@ def chunk_eval_node(state: PipelineState, config):
 
 @traceable
 def embedding_node(state: PipelineState, config):
-    MAX_TOKENS = 8192  # For OpenAI text-embedding-3-small
+    faiss_path = config.get("faiss_path", "data/fin_rag_faiss.index")
+    metadata_path = config.get("metadata_path", "data/fin_rag_metadata.json")
+    embeddings_path = config.get("embeddings_path", "data/fin_rag_embeddings.npy")
+    
+    # Try loading
+    index, metadata, embeddings = maybe_load_embeddings(faiss_path, metadata_path, embeddings_path)
+    if index is not None and metadata is not None and embeddings is not None:
+        print(f"[Embedding Node] Loaded FAISS, metadata, embeddings from disk.")
+        state.embeddings = embeddings
+        state.chunk_metadata = metadata
+        # Re-wrap index in your FaissVectorStore if needed
+        embedding_dim = embeddings.shape[1]
+        faiss_store = FaissVectorStore(embedding_dim=embedding_dim, index=index)
+        state.vector_store = faiss_store
+        return state  # SKIP rest of embedding!
 
+    MAX_TOKENS = 8192  # For OpenAI text-embedding-3-small
     filtered_texts = []
     for chunk in state.chunks:
         chunk_text = chunk['chunk']
@@ -189,7 +209,6 @@ def embedding_node(state: PipelineState, config):
             split_chunks = split_chunk_on_token_limit(chunk_text, model=config.get("embedding_model", "text-embedding-3-small"), max_tokens=MAX_TOKENS)
             print(f"[Embedding Node] Split into {len(split_chunks)} chunks.")
             filtered_texts.extend(split_chunks)
-
     if not filtered_texts:
         print("[Embedding Node] No chunks to embed! Check chunking and cleaning logic.")
         state.embeddings = None
@@ -198,6 +217,33 @@ def embedding_node(state: PipelineState, config):
     print(f"[Embedding Node] Embedding {len(filtered_texts)} chunks using {config['embedder']} ({config.get('embedding_model')})...")
     embeddings = embed_texts(filtered_texts, config)
     state.embeddings = embeddings
+    state.chunk_metadata = state.chunks  # Or add any additional info you want in metadata
+
+    # Now persist (save) everything so next run can reuse!
+    t0 = time.time()
+    faiss_store = FaissVectorStore(embedding_dim=embeddings.shape[1])
+    chunk_ids = [str(i) for i in range(len(state.chunks))]
+    faiss_store.add_embeddings(chunk_ids, embeddings, state.chunk_metadata)
+    # Save FAISS, metadata, and embeddings to disk
+    save_faiss_and_metadata(faiss_store, state.chunk_metadata, faiss_path, metadata_path)
+    np.save(embeddings_path, embeddings)
+    state.vector_store = faiss_store
+    t1 = time.time()
+    print(f"[Embedding Node] Saved FAISS, metadata, and embeddings to disk.")
+
+    state.metrics['storage_latency'] = t1 - t0
+    state.metrics['embedding_shape'] = state.embeddings.shape if state.embeddings is not None else None
+    state.eval_logs.append({
+        "stage": "embedding",
+        "n_chunks": len(filtered_texts),
+        "embedding_shape": str(getattr(state.embeddings, 'shape', None)),
+        "timestamp": time.time(),
+    })
+    state.eval_logs.append({    
+        "stage": "storage_latency",
+        "latency": t1 - t0,
+        "timestamp": t1,
+    })
     print(f"[Embedding Node] Embedding shape: {embeddings.shape}")
     print('=================================')
     print(' ')
@@ -229,6 +275,13 @@ def embedding_eval_node(state: PipelineState, config):
     }
     print(f"[Embedding Eval Node] recall@5={recall:.2f}, ndcg@10={ndcg:.2f}")
     state.embedding_metrics = metrics
+    state.ragas_metrics['embedding'] = metrics
+    state.eval_logs.append({
+        "stage": "embedding_eval",
+        "recall@5": recall,
+        "ndcg@10": ndcg,
+        "timestamp": time.time(),
+    })
     print('=================================')
     print(' ')
     # print('Embedding Eval Module Summary:')
@@ -237,15 +290,8 @@ def embedding_eval_node(state: PipelineState, config):
 
 @traceable
 def hybrid_storage_node(state: PipelineState, config):
-    embedding_dim = state.embeddings.shape[1]
-    vec_store = FaissVectorStore(embedding_dim=embedding_dim)
-    chunk_ids = [str(i) for i in range(len(state.chunks))]
     chunk_texts = [c["chunk"] for c in state.chunks]
-    metadatas = state.chunks
-    vec_store.add_embeddings(chunk_ids, state.embeddings, metadatas)
-
     bm25_store = BM25Store(chunk_texts)
-    state.vector_store = vec_store
     state.bm25_store = bm25_store
     print("[Hybrid Storage Node] FAISS vector store and BM25 store ready.")
     print('=================================')
@@ -344,10 +390,7 @@ def retrieval_and_rerank_node(state: PipelineState, config):
     chunk_indices = [idx for idx, _ in hybrid_results]
     candidate_chunks = [state.chunks[idx]["chunk"] for idx in chunk_indices]
 
-    print("\n=== [DEBUG] Initial Hybrid Retrieval Results ===")
-    for i, (idx, score) in enumerate(hybrid_results):
-        print(f"[{i}] idx={idx}, score={score:.3f}")
-        print(f"Content preview: {candidate_chunks[i][:200]}\n")
+    # debug_print_reranked("Initial Hybrid Retrieval Results", hybrid_results, candidate_chunks, chunk_indices, top_k)
 
     # Reranking (choose model based on config)
     rerank_method = config.get("rerank_method", "cohere")  # or "bge"
@@ -386,42 +429,54 @@ def retrieval_and_rerank_node(state: PipelineState, config):
     #     context_chunks = select_context_with_llm(query, context_chunks, max_context_chars=3500, model=config.get("llm_selector_model", "gpt-4o-mini"))
 
     # context_chunks = candidate_chunks[:5]
-    print("\n=== [DEBUG] After Reranking ===")
-    for i, (idx, score) in enumerate(reranked):
-        print(f"[{i}] idx={idx}, score={score:.3f}")
-        print(f"Content preview: {candidate_chunks[idx][:200]}\n")
+    
+    # debug_print_reranked("After Reranking", reranked, candidate_chunks, chunk_indices, top_k)
 
     reranked_indices = [chunk_indices[i] for i, _ in reranked]
-    
     context_chunks = [state.chunks[i]["chunk"] for i in reranked_indices]
 
-
-    # DEBUGGING
-
-    print("\n=== [DEBUG] Final Context Chunks ===")
-    for i, chunk in enumerate(context_chunks):
-        print(f"[{i}] len={len(chunk)} preview={chunk[:120]!r}")
-
-    # DEBUGGING
+    # debug_print_reranked("Final Context Chunks", reranked, context_chunks, reranked_indices, top_k)
 
     # Post-processing
     context_chunks = deduplicate_chunks(context_chunks)
     context_chunks = remove_noise(context_chunks)
 
-    print("\n=== [DEBUG] Final Selected Context ===")
-    for i, chunk in enumerate(context_chunks):
-        print(f"[{i}] len={len(chunk)}")
-        print(f"Content preview: {chunk[:200]}\n")
+    # debug_print_reranked("Final Selected Context", reranked, state.chunks, chunk_indices, top_k)
+    # context_chunks = [state.chunks[idx]['chunk'] for idx, _ in reranked[:top_k]]
 
+    print("=== [DEBUG] Final Selected Context ===")
+    for i, (idx, score) in enumerate(reranked[:top_k]):
+        chunk = context_chunks[i]
+        print(f"[{i}] state.chunks idx={idx}, score={score:.3f}")
+        print(f"Content preview: {chunk!r}")
+    
+    # Calculate top-k recall for a labeled QA pair, if available
+    # (You'd need gold indices for real eval)
+    # Example:
+    if hasattr(state, "gold_answers"):
+        metrics = retrieval_metrics(state.query, context_chunks, state.gold_answers)
+        state.ragas_metrics['retrieval'] = metrics
+    
+    # state.ragas_metrics['retrieval'] = {
+        # "retrieved_indices": reranked_indices,
+        # ...add recall@k, ndcg, etc if available
+    # }
+    state.eval_logs.append({
+        "stage": "retrieval_rerank",
+        "retrieved_indices": reranked_indices,
+        "timestamp": time.time(),
+    })
     # Store for downstream
     state.selected_context = context_chunks
-    print(context_chunks) #[0])
+    # print(context_chunks) #[0])
+
     print(f"[Retrieval+Rerank] {len(context_chunks)} final context chunks selected.")
     print('=================================')
     print(' ')
     # print('Retrieval and Reranking Module Summary:')
     # print_metrics_block(state.metrics)
     # print_pipeline_summary(state) 
+    # debug_state(state)
     # print(">>> retrieval_and_rerank_node sets selected_context with", len(state.selected_context), "chunks")
     '''print("=== STATE DUMP ===")
     for k in state.__dict__:
@@ -463,10 +518,7 @@ def llm_generation_node(state: PipelineState, config):
         context_chunks = candidate_chunks
         print("\nUsing all candidate chunks without advanced selection")
     
-    print("\n=== [DEBUG] Final Context for LLM ===")
-    for i, chunk in enumerate(context_chunks):
-        print(f"[{i}] len={len(chunk)}")
-        print(f"Content preview: {chunk[:200]}\n")
+    # debug_print_chunks("Final Context for LLLM", context_chunks, len(context_chunks))
 
     context = "\n\n".join(context_chunks)[:config.get("context_limit", 8000)]
     prompt_template = config.get("prompt_template", None)
@@ -496,21 +548,29 @@ def llm_generation_node(state: PipelineState, config):
     # Append to history
     state.history = history + [{"user": query, "assistant": answer}]
     
+    # After answer generated:
+    # Call RAGAS (or your validation code) here:
+    # e.g., ragas_metrics = ragas.evaluate(...)
+    # state.ragas_metrics['llm_generation'] = ragas_metrics
+    ragas_scores = evaluate_generation_with_ragas(state.llm_answer, "\n\n".join(context_chunks), state.query)
+    state.ragas_metrics['generation'] = ragas_scores
+    state.eval_logs.append({
+        "stage": "generation_eval",
+        **ragas_scores,
+        "timestamp": time.time(),
+    })
+    
+    state.eval_logs.append({
+        "stage": "generation",
+        "llm_answer": state.llm_answer,
+        "timestamp": time.time(),
+    })
+
     print(f"\n[LLM Generation Node] Generated Answer:\n{answer}\n")
     print('=================================')
     print(' ')
     # print('LLM Generation Module Summary:')
     # print_pipeline_summary(state) 
-    '''print("=== STATE DUMP ===")
-    for k in state.__dict__:
-        v = getattr(state, k)
-        if isinstance(v, list):
-            print(f"{k}: list with {len(v)} items")
-        elif isinstance(v, dict):
-            print(f"{k}: dict with {len(v)} keys")
-        else:
-            print(f"{k}: {type(v)}")'''
-
     return state
 
 @traceable
@@ -524,6 +584,13 @@ def answer_validation_node(state: PipelineState, config):
     max_iters = config.get("max_validation_iters", 3)
 
     val_result = validate_answer(answer, context, query, config=config)
+
+    state.eval_logs.append({
+        "stage": "validation",
+        "answer": answer,
+        "validation_result": val_result,
+        "timestamp": time.time(),
+    })
 
     print("[Answer Validation]")
     print("Hallucination:", val_result["hallucination"])
@@ -573,16 +640,20 @@ def finish_node(state: "PipelineState", config):
     print(f"Status: {status}")
     # Optionally print key metrics or history
     metrics = getattr(state, "metrics", {})
-    if metrics:
-        print("\n[Pipeline Metrics]")
-        for k, v in metrics.items():
-            print(f"  {k}: {v}")
+    debug_print_metrics("Pipeline Metrics", metrics)
     # Optionally print chat history
     history = getattr(state, "history", [])
     if history:
         print("\n[Conversation History]")
         for i, turn in enumerate(history, 1):
             print(f"{i:02d}. User: {turn['user']}\n    Assistant: {turn['assistant']}")
+
+    import json
+    with open("data/eval_logs.json", "w") as f:
+        json.dump(json_safe(state.eval_logs), f, indent=2)
+    with open("data/ragas_metrics.json", "w") as f:
+        json.dump(state.ragas_metrics, f, indent=2)
+
     # Return state so LangGraph finishes cleanly
     return state
 
@@ -645,15 +716,7 @@ def run_pipeline(config=EXPERIMENT_CONFIG):
     print(' ')
     print("Pipeline complete. Results:")
 
-    '''
-    if "final_state" in result_state:
-        print_pipeline_summary(result_state["final_state"])
-    else:
-        print_pipeline_summary(result_state)
-
-    print(f"Type of result_state: {type(result_state)}")
-    '''
-    print(result_state.keys())
+    # print(result_state.keys())
     for k, v in result_state.items():
         print(f"Key: {k} | Value type: {type(v)}")
 

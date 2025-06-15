@@ -265,3 +265,37 @@ def sub_chunk_section(text, max_chars=3000, overlap=500):
             next_start = start + 1
         start = next_start
     return chunks
+
+def debug_print_chunks(label, chunks, n=3):
+    print(f"\n=== [DEBUG] {label} (showing {min(n, len(chunks))} of {len(chunks)}) ===")
+    for i, chunk in enumerate(chunks[:n]):
+        chunk_text = chunk if isinstance(chunk, str) else chunk.get("chunk", "")  # Handle dict or str
+        print(f"[{i}] len={len(chunk_text)}\nPreview: {chunk_text[:200]!r}\n")
+    print("="*30)
+
+def debug_print_metrics(label, metrics):
+    print(f"\n=== [DEBUG] {label} ===")
+    for k, v in metrics.items():
+        print(f"{k}: {v}")
+    print("="*30)
+
+def debug_print_reranked(label, reranked, candidate_chunks, chunk_indices, n=5):
+    print(f"\n=== [DEBUG] {label} ===")
+    for i, (idx, score) in enumerate(reranked[:n]):
+        # idx is index into *state.chunks*
+        # chunk_indices maps position in candidate_chunks -> index in state.chunks
+        try:
+            candidate_idx = chunk_indices.index(idx)
+            chunk = candidate_chunks[candidate_idx]
+        except ValueError:
+            chunk = f"[Chunk index {idx} not found in candidate_chunks]"
+        print(f"[{i}] state.chunks idx={idx}, score={score:.3f}")
+        print(f"Content preview: {chunk[:200]!r}")
+    print("="*30)
+
+
+def debug_state(state):
+    print("\n=== [DEBUG] STATE DUMP ===")
+    for k, v in state.__dict__.items():
+        print(f"{k}: {type(v)} ({str(v)[:80]})")
+    print("="*30)

@@ -10,7 +10,9 @@ python-dotenv
 pinecone-client
 chromadb
 sentence-transformers
+bert-score
 ragas
+ragas[openai]
 pyyaml
 dotenv
 sec_edgar_downloader

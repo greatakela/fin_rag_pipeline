@@ -4,13 +4,16 @@
 # It includes functions for dense, sparse, and hybrid retrieval.
 
 import numpy as np
-import faiss
 from rank_bm25 import BM25Okapi
 
 class FaissVectorStore:
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim=None, index=None):
+        import faiss
+        if index is not None:
+            self.index = index
+        else:
+            self.index = faiss.IndexFlatL2(embedding_dim)
         self.embedding_dim = embedding_dim
-        self.index = faiss.IndexFlatL2(embedding_dim)
         self.ids = []
         self.metadata = []
 
