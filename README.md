@@ -74,6 +74,10 @@ The pipeline is highly configurable through the `EXPERIMENT_CONFIG` in `src/edga
 
 ### Basic Pipeline Execution
 
+```bash
+python -m src.edgar_rag.langgraph_pipeline
+```
+
 ```python
 from src.edgar_rag.langgraph_pipeline import run_pipeline
 from src.edgar_rag.config import EXPERIMENT_CONFIG
